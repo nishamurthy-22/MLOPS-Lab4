@@ -1,14 +1,18 @@
-#Train a penguin species classifier and log it to MLflow.
+#Train and compare penguin species classifiers, logging each to MLflow.
 
 import mlflow
 import mlflow.sklearn
 from mlflow.models import infer_signature
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, log_loss
+from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.svm import SVC
 
 from src.data import (
     CATEGORICAL_FEATURES,
@@ -20,13 +24,38 @@ from src.data import (
 
 TRACKING_URI = "http://127.0.0.1:5001"
 EXPERIMENT_NAME = "penguin-species"
+RANDOM_STATE = 42
 
-# Types skops needs permission to save; tree-based models (added later) use this one.
-SKOPS_TRUSTED_TYPES = ["sklearn.tree._tree.Tree", "numpy.dtype"]
+#Types skops needs permission to save: numpy.dtype comes from the OneHotEncoder,
+#sklearn.tree._tree.Tree from the tree-based models, and the two calibration
+#types from the calibrated SVM.
+SKOPS_TRUSTED_TYPES = [
+    "sklearn.tree._tree.Tree",
+    "numpy.dtype",
+    "sklearn.calibration._CalibratedClassifier",
+    "sklearn.calibration._SigmoidCalibration",
+]
 
 
+#SVC no longer outputs probabilities by itself, so wrap it in a calibrator.
+def calibrated_svc(C=1.0, kernel="rbf"):
+    return CalibratedClassifierCV(SVC(C=C, kernel=kernel), ensemble=False)
+
+
+#Each entry: run name -> (model class, hyperparameters)
+MODELS = {
+    "logistic_regression": (LogisticRegression, {"C": 1.0, "max_iter": 1000}),
+    "svm_rbf": (calibrated_svc, {"C": 1.0, "kernel": "rbf"}),
+    "random_forest": (RandomForestClassifier, {"n_estimators": 200, "max_depth": 5, "random_state": RANDOM_STATE}),
+    "gradient_boosting": (
+        GradientBoostingClassifier,
+        {"n_estimators": 100, "learning_rate": 0.1, "max_depth": 3, "random_state": RANDOM_STATE},
+    ),
+}
+
+
+#Wrap a model with preprocessing, so the saved model accepts raw penguin data.
 def build_pipeline(model):
-    #Wrap a model with preprocessing, so the saved model accepts raw penguin data.
     numeric = Pipeline([
         ("impute", SimpleImputer(strategy="median")),
         ("scale", StandardScaler()),
@@ -42,29 +71,44 @@ def build_pipeline(model):
     return Pipeline([("preprocess", preprocess), ("model", model)])
 
 
-def evaluate(y_true, y_pred):
-    #Return accuracy and macro F1 (macro F1 weights all three species equally).
+#Score the pipeline on 5 stratified folds of the training data.
+def cross_validate_model(pipeline, X, y):
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    scores = cross_validate(pipeline, X, y, cv=cv, scoring=["accuracy", "f1_macro", "neg_log_loss"])
     return {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "f1_macro": f1_score(y_true, y_pred, average="macro"),
+        "cv_accuracy_mean": scores["test_accuracy"].mean(),
+        "cv_accuracy_std": scores["test_accuracy"].std(),
+        "cv_f1_macro_mean": scores["test_f1_macro"].mean(),
+        "cv_f1_macro_std": scores["test_f1_macro"].std(),
+        #sklearn reports log loss as a negative number, so flip the sign back
+        "cv_log_loss_mean": -scores["test_neg_log_loss"].mean(),
+        "cv_log_loss_std": scores["test_neg_log_loss"].std(),
     }
 
 
-def main():
-    mlflow.set_tracking_uri(TRACKING_URI)
-    mlflow.set_experiment(EXPERIMENT_NAME)
+#Score a fitted pipeline on the held-out test set.
+def evaluate(pipeline, X, y):
+    y_pred = pipeline.predict(X)
+    y_proba = pipeline.predict_proba(X)
+    return {
+        "test_accuracy": accuracy_score(y, y_pred),
+        "test_f1_macro": f1_score(y, y_pred, average="macro"),
+        "test_log_loss": log_loss(y, y_proba, labels=pipeline.classes_),
+    }
 
-    df = clean_data(load_data())
-    X_train, X_test, y_train, y_test = split_data(df)
 
-    pipeline = build_pipeline(LogisticRegression(max_iter=1000))
+#Cross-validate, train, test, and log one model as an MLflow run.
+def train_and_log(run_name, model_class, params, X_train, X_test, y_train, y_test):
+    pipeline = build_pipeline(model_class(**params))
 
-    with mlflow.start_run(run_name="logistic_regression"):
+    with mlflow.start_run(run_name=run_name):
+        mlflow.set_tags({"dataset": "palmer_penguins", "model_type": model_class.__name__})
+        mlflow.log_params(params)
+
+        cv_metrics = cross_validate_model(pipeline, X_train, y_train)
         pipeline.fit(X_train, y_train)
-        metrics = evaluate(y_test, pipeline.predict(X_test))
-
-        mlflow.set_tag("dataset", "palmer_penguins")
-        mlflow.log_params({"model_type": "LogisticRegression", "max_iter": 1000, "test_size": 0.2})
+        test_metrics = evaluate(pipeline, X_test, y_test)
+        metrics = {**cv_metrics, **test_metrics}
         mlflow.log_metrics(metrics)
 
         signature = infer_signature(X_train, pipeline.predict(X_train))
@@ -76,7 +120,23 @@ def main():
             skops_trusted_types=SKOPS_TRUSTED_TYPES,
         )
 
-        print(f"LogisticRegression: {metrics}")
+    return metrics
+
+
+#Load the data, then train and log every model in MODELS.
+def main():
+    mlflow.set_tracking_uri(TRACKING_URI)
+    mlflow.set_experiment(EXPERIMENT_NAME)
+
+    df = clean_data(load_data())
+    X_train, X_test, y_train, y_test = split_data(df)
+
+    for run_name, (model_class, params) in MODELS.items():
+        m = train_and_log(run_name, model_class, params, X_train, X_test, y_train, y_test)
+        print(
+            f"{run_name:20s} cv_f1={m['cv_f1_macro_mean']:.3f}  "
+            f"cv_log_loss={m['cv_log_loss_mean']:.3f}  test_f1={m['test_f1_macro']:.3f}"
+        )
 
 
 if __name__ == "__main__":
