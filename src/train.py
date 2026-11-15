@@ -1,7 +1,9 @@
-#Train and compare penguin species classifiers, logging each to MLflow.
+#Train and compare penguin species classifiers, logging each to MLflow,
+#then register the best one in the Model Registry.
 
 import mlflow
 import mlflow.sklearn
+from mlflow import MlflowClient
 from mlflow.models import infer_signature
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
@@ -24,6 +26,8 @@ from src.data import (
 
 TRACKING_URI = "http://127.0.0.1:5001"
 EXPERIMENT_NAME = "penguin-species"
+REGISTERED_MODEL_NAME = "penguin-species-classifier"
+CHAMPION_ALIAS = "champion"
 RANDOM_STATE = 42
 
 #Types skops needs permission to save: numpy.dtype comes from the OneHotEncoder,
@@ -98,6 +102,7 @@ def evaluate(pipeline, X, y):
 
 
 #Cross-validate, train, test, and log one model as an MLflow run.
+#Returns the metrics and the URI of the logged model.
 def train_and_log(run_name, model_class, params, X_train, X_test, y_train, y_test):
     pipeline = build_pipeline(model_class(**params))
 
@@ -112,7 +117,7 @@ def train_and_log(run_name, model_class, params, X_train, X_test, y_train, y_tes
         mlflow.log_metrics(metrics)
 
         signature = infer_signature(X_train, pipeline.predict(X_train))
-        mlflow.sklearn.log_model(
+        model_info = mlflow.sklearn.log_model(
             pipeline,
             name="model",
             signature=signature,
@@ -120,10 +125,25 @@ def train_and_log(run_name, model_class, params, X_train, X_test, y_train, y_tes
             skops_trusted_types=SKOPS_TRUSTED_TYPES,
         )
 
-    return metrics
+    return {"metrics": metrics, "model_uri": model_info.model_uri}
 
 
-#Load the data, then train and log every model in MODELS.
+#Register the model with the lowest CV log loss and point the champion alias at it.
+def register_best(results):
+    best_name = min(results, key=lambda name: results[name]["metrics"]["cv_log_loss_mean"])
+    best = results[best_name]
+
+    version = mlflow.register_model(best["model_uri"], REGISTERED_MODEL_NAME)
+
+    client = MlflowClient()
+    client.set_registered_model_alias(REGISTERED_MODEL_NAME, CHAMPION_ALIAS, version.version)
+    client.set_model_version_tag(REGISTERED_MODEL_NAME, version.version, "selected_by", "lowest cv_log_loss_mean")
+    client.set_model_version_tag(REGISTERED_MODEL_NAME, version.version, "run_name", best_name)
+
+    return best_name, version.version
+
+
+#Load the data, train and log every model in MODELS, then register the best one.
 def main():
     mlflow.set_tracking_uri(TRACKING_URI)
     mlflow.set_experiment(EXPERIMENT_NAME)
@@ -131,12 +151,17 @@ def main():
     df = clean_data(load_data())
     X_train, X_test, y_train, y_test = split_data(df)
 
+    results = {}
     for run_name, (model_class, params) in MODELS.items():
-        m = train_and_log(run_name, model_class, params, X_train, X_test, y_train, y_test)
+        results[run_name] = train_and_log(run_name, model_class, params, X_train, X_test, y_train, y_test)
+        m = results[run_name]["metrics"]
         print(
             f"{run_name:20s} cv_f1={m['cv_f1_macro_mean']:.3f}  "
             f"cv_log_loss={m['cv_log_loss_mean']:.3f}  test_f1={m['test_f1_macro']:.3f}"
         )
+
+    best_name, version = register_best(results)
+    print(f"\nBest model: {best_name}, registered as {REGISTERED_MODEL_NAME} v{version} (@{CHAMPION_ALIAS})")
 
 
 if __name__ == "__main__":
