@@ -5,3 +5,4 @@ mlruns/
 mlartifacts/
 mlflow.db
 .DS_Store
+.pytest_cache/
