@@ -162,9 +162,14 @@ def train_and_log(run_name, model_class, params, X_train, X_test, y_train, y_tes
     return {"metrics": metrics, "model_uri": model_info.model_uri}
 
 
-#Register the model with the lowest CV log loss and point the champion alias at it.
+#Pick the run name with the lowest CV log loss.
+def select_best(results):
+    return min(results, key=lambda name: results[name]["metrics"]["cv_log_loss_mean"])
+
+
+#Register the best model and point the champion alias at it.
 def register_best(results):
-    best_name = min(results, key=lambda name: results[name]["metrics"]["cv_log_loss_mean"])
+    best_name = select_best(results)
     best = results[best_name]
 
     version = mlflow.register_model(best["model_uri"], REGISTERED_MODEL_NAME)
