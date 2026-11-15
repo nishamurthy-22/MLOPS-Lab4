@@ -1,6 +1,12 @@
 #Train and compare penguin species classifiers, logging each to MLflow,
 #then register the best one in the Model Registry.
 
+import matplotlib
+
+#Draw plots to files only, without opening a window.
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
 import mlflow
 import mlflow.sklearn
 from mlflow import MlflowClient
@@ -10,8 +16,14 @@ from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, log_loss
-from sklearn.model_selection import StratifiedKFold, cross_validate
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    accuracy_score,
+    classification_report,
+    f1_score,
+    log_loss,
+)
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.svm import SVC
@@ -75,10 +87,14 @@ def build_pipeline(model):
     return Pipeline([("preprocess", preprocess), ("model", model)])
 
 
+#The same 5 stratified folds are used for scoring and for the artifacts.
+def make_cv():
+    return StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+
 #Score the pipeline on 5 stratified folds of the training data.
 def cross_validate_model(pipeline, X, y):
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    scores = cross_validate(pipeline, X, y, cv=cv, scoring=["accuracy", "f1_macro", "neg_log_loss"])
+    scores = cross_validate(pipeline, X, y, cv=make_cv(), scoring=["accuracy", "f1_macro", "neg_log_loss"])
     return {
         "cv_accuracy_mean": scores["test_accuracy"].mean(),
         "cv_accuracy_std": scores["test_accuracy"].std(),
@@ -88,6 +104,22 @@ def cross_validate_model(pipeline, X, y):
         "cv_log_loss_mean": -scores["test_neg_log_loss"].mean(),
         "cv_log_loss_std": scores["test_neg_log_loss"].std(),
     }
+
+
+#Log a confusion matrix image and a per-species report built from the
+#cross-validation predictions, where each penguin is predicted by a model
+#that did not see it during training.
+def log_cv_artifacts(pipeline, X, y, run_name):
+    y_pred = cross_val_predict(pipeline, X, y, cv=make_cv())
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ConfusionMatrixDisplay.from_predictions(y, y_pred, ax=ax, colorbar=False, cmap="Blues")
+    ax.set_title(f"{run_name}: 5-fold CV predictions")
+    fig.tight_layout()
+    mlflow.log_figure(fig, "cv_confusion_matrix.png")
+    plt.close(fig)
+
+    mlflow.log_text(classification_report(y, y_pred, digits=3), "cv_classification_report.txt")
 
 
 #Score a fitted pipeline on the held-out test set.
@@ -111,6 +143,8 @@ def train_and_log(run_name, model_class, params, X_train, X_test, y_train, y_tes
         mlflow.log_params(params)
 
         cv_metrics = cross_validate_model(pipeline, X_train, y_train)
+        log_cv_artifacts(pipeline, X_train, y_train, run_name)
+
         pipeline.fit(X_train, y_train)
         test_metrics = evaluate(pipeline, X_test, y_test)
         metrics = {**cv_metrics, **test_metrics}
