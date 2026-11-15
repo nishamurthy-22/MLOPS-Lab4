@@ -94,7 +94,7 @@ All commands are run from the repo root with the virtual environment active. Ste
 mlflow ui --port 5001
 ```
 
-The UI opens at http://127.0.0.1:5001. Port 5001 is used because macOS's AirPlay Receiver takes port 5000.
+The UI opens at http://127.0.0.1:5001.
 
 **2. Train, compare, and register the models**
 
@@ -149,7 +149,7 @@ The original notebooks were written for an older MLflow version. To run them on 
 
 - **Tracking URI.** Added `mlflow.set_tracking_uri("http://127.0.0.1:5001")`, because logging a model requires going through the tracking server.
 - **skops trusted types.** MLflow 3 saves scikit-learn models in the safer skops format, which asks for permission to save some internal types. Added `skops_trusted_types=["sklearn.tree._tree.Tree"]` for the Random Forest.
-- **Loading and serving by URI.** Replaced the instructor's hardcoded `mlruns/0/<run-id>/...` paths with `runs:/<run-id>/model`, because MLflow 3 stores models in a different location.
+- **Loading and serving by URI.** Replaced hardcoded `mlruns/0/<run-id>/...` paths with `runs:/<run-id>/model`, because MLflow 3 stores models in a different location.
 - **Serving port.** Served the model on port 5002, since the tracking server uses 5001.
 
 With these fixes, the served Linear Regression model in `serving.ipynb` returned exactly the same predictions as the instructor's notebook output. One small issue in the original: `serving.ipynb` trains a Linear Regression but registers it under the name `RandomForest`.
